@@ -5,6 +5,7 @@ from config import API_TOKEN, JWT_SECRET_KEY, JWT_ACCESS_TOKEN_EXPIRES
 from models.reading import SensorReading, Machine, SystemLog, Reading
 from services.database import get_connection
 import bcrypt
+import json
 
 app = Flask(__name__)
 
@@ -206,6 +207,176 @@ def get_dates():
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'API running'})
+
+
+# Device LED Control endpoints
+@app.route('/device_status', methods=['POST'])
+@auth_required
+def update_device_status():
+    """Update device status including filtered LED states (status + activity only)"""
+    try:
+        data = request.get_json()
+
+        # Ensure machine_id is provided
+        if 'machine_id' not in data:
+            return jsonify({'error': 'machine_id is required'}), 400
+
+        # Define which LEDs are supported (status + activity)
+        valid_leds = ['status', 'activity']
+        incoming_leds = data.get('led_states', {})
+
+        # Only keep allowed LED states
+        filtered_leds = {k: v for k, v in incoming_leds.items() if k in valid_leds}
+
+        # Save to database
+        db = get_connection()
+        cursor = db.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO device_status (machine_id, led_states, last_updated)
+                VALUES (%s, %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                led_states = VALUES(led_states),
+                last_updated = NOW()
+            """, (data['machine_id'], json.dumps(filtered_leds)))
+
+            db.commit()
+            return jsonify({'status': 'device status updated'}), 200
+
+        finally:
+            cursor.close()
+            db.close()
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/device_status/<machine_id>', methods=['GET'])
+@jwt_required()
+def get_device_status(machine_id):
+    """Get current device status including only 'status' and 'activity' LED states"""
+    try:
+        db = get_connection()
+        cursor = db.cursor(dictionary=True)
+
+        try:
+            cursor.execute("""
+                SELECT ds.*, m.machine_name, m.location
+                FROM device_status ds
+                JOIN machines m ON ds.machine_id = m.machine_id
+                WHERE ds.machine_id = %s
+            """, (machine_id,))
+
+            status = cursor.fetchone()
+
+            if not status:
+                return jsonify({'error': 'Device not found'}), 404
+
+            # Parse and filter LED states
+            if status.get('led_states'):
+                try:
+                    raw_leds = json.loads(status['led_states'])
+                    valid_leds = ['status', 'activity']
+                    filtered_leds = {k: v for k, v in raw_leds.items() if k in valid_leds}
+                    status['led_states'] = filtered_leds
+                except Exception:
+                    status['led_states'] = {}  # fallback if JSON parsing fails
+
+            return jsonify(status), 200
+
+        finally:
+            cursor.close()
+            db.close()
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/led_control/<machine_id>', methods=['POST'])
+@jwt_required()
+def control_led(machine_id):
+    """Send LED control command to device"""
+    try:
+        data = request.get_json()
+        current_user = get_jwt_identity()
+
+        required_fields = ['led', 'state']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+
+        valid_leds = ['status', 'activity']
+        if data['led'] not in valid_leds:
+            return jsonify({'error': f'Invalid LED name. Must be one of: {valid_leds}'}), 400
+
+        if not isinstance(data['state'], bool):
+            return jsonify({'error': 'State must be true or false'}), 400
+
+        db = get_connection()
+        cursor = db.cursor()
+
+        try:
+            cursor.execute("""
+                INSERT INTO device_commands (machine_id, command_type, command_data, created_by, created_at)
+                VALUES (%s, 'led_control', %s, %s, NOW())
+            """, (machine_id, json.dumps({
+                'type': 'led_control',
+                'led': data['led'],
+                'state': data['state']
+            }), current_user))
+
+            command_id = cursor.lastrowid
+            db.commit()
+
+            return jsonify({
+                'status': 'command queued',
+                'command_id': command_id,
+                'machine_id': machine_id,
+                'led': data['led'],
+                'state': data['state']
+            }), 200
+
+        finally:
+            cursor.close()
+            db.close()
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/device_status/<machine_id>', methods=['GET'])
+@jwt_required()
+def get_device_status(machine_id):
+    """Get current device status including LED states"""
+    try:
+        db = get_connection()
+        cursor = db.cursor(dictionary=True)
+
+        try:
+            cursor.execute("""
+                SELECT ds.*, m.machine_name, m.location
+                FROM device_status ds
+                JOIN machines m ON ds.machine_id = m.machine_id
+                WHERE ds.machine_id = %s
+            """, (machine_id,))
+
+            status = cursor.fetchone()
+
+            if not status:
+                return jsonify({'error': 'Device not found'}), 404
+
+            # Parse LED states JSON
+            if status['led_states']:
+                status['led_states'] = json.loads(status['led_states'])
+
+            return jsonify(status), 200
+
+        finally:
+            cursor.close()
+            db.close()
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # New IoT endpoints (protected with JWT)
